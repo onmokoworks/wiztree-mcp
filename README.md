@@ -17,10 +17,16 @@ The server never deletes files. It only launches WizTree for export and reads ge
 
 ## Setup
 
+Clone the repo, enter the repo folder, install dependencies, and build the TypeScript output.
+
 ```powershell
+git clone https://github.com/onmokoworks/wiztree-mcp.git
+cd wiztree-mcp
 npm install
 npm run build
 ```
+
+This produces `dist/index.js`, which is the file your MCP client should run.
 
 ## MCP Config
 
@@ -41,6 +47,30 @@ Replace `C:\\path\\to\\wiztree-mcp` with the folder where you cloned this repo.
 ```
 
 `WIZTREE_PATH` is optional if WizTree is installed in a common location or is on `PATH`.
+
+For Codex, add the same server to `C:\\Users\\<you>\\.codex\\config.toml`:
+
+```toml
+[mcp_servers.wiztree]
+command = 'node'
+args = ['C:\path\to\wiztree-mcp\dist\index.js']
+startup_timeout_sec = 120
+
+[mcp_servers.wiztree.env]
+WIZTREE_PATH = 'C:\Program Files\WizTree\WizTree64.exe'
+```
+
+After changing MCP configuration, restart the MCP client or open a new session so it reloads the server list.
+
+## Smoke Test
+
+You can verify that the compiled server starts with:
+
+```powershell
+node .\dist\index.js
+```
+
+The process waits for MCP JSON-RPC messages over stdio, so it will appear idle. Press `Ctrl+C` to stop it.
 
 ## Privacy
 
