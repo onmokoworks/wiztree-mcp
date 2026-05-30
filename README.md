@@ -1,5 +1,7 @@
 # WizTree MCP
 
+[日本語](./README.ja.md) | [English](./README.md)
+
 Read-only MCP server that wraps WizTree's CSV export and adds disk-usage analysis tools.
 
 > Windows-only in practice, because it depends on WizTree.
