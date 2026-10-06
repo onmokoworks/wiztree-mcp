@@ -163,7 +163,8 @@ rules. Normal scans create no persistent CSV/PNG exports.
 ## Implementation / validation
 Added native scanning, Windows temporary-export lifecycle, shared named snapshot
 saves, in-memory handles, optional cleanup-tool disablement and fixture tests.
-Dependencies remain unchanged; no native packages were added.
+Direct dependency declarations and package names are unchanged; patched
+transitive versions are recorded in the lockfile without adding native packages.
 
 `npm run typecheck`, `npm run build`, `npm test` (16 tests) and `git diff --check` pass.
 Tests cover native sizes, symlinks, hardlinks, permission errors, cancellation and
@@ -177,6 +178,30 @@ removed after execution (the 128 MiB budget fixture is sparse).
 
 Validation used only fixtures; no real disk scan, user-data deletion, MCP
 registration or persistent permission expansion was performed.
+
+## Dependency audit follow-up
+
+`npm audit --audit-level=high` passes after compatible transitive updates; the
+existing CI threshold is unchanged. No forced or major update was used, and
+installed versions were checked against the lockfile after `npm ci --ignore-scripts`.
+
+| Package | Original severity | Kind | Locked version before → after | Fixed from |
+| --- | --- | --- | --- | --- |
+| proxy-addr | critical | transitive | 2.0.7 → 2.0.8 | 2.0.8 |
+| fast-uri | high | transitive | 3.1.2 → 3.1.8 | 3.1.8 |
+| hono | high | transitive | 4.12.23 → 4.13.13 | 4.13.7 |
+| ip-address | high | transitive | 10.2.0 → 10.7.3 | 10.7.1 |
+| @hono/node-server | moderate | transitive | 1.19.14 → 1.19.17 | 1.19.15 |
+| qs | moderate | transitive | 6.15.2 → 6.16.0 | 6.16.0 |
+| esbuild | low | transitive/dev | 0.28.0 → 0.28.2 | 0.28.1 |
+| body-parser | low | transitive | 2.2.2 (retained) | 2.3.0 |
+| csv-parse | moderate | direct | 5.6.0 (retained) | 7.0.2 |
+
+The compatible `qs` update also patches existing `side-channel` 1.1.0 → 1.1.1;
+esbuild's existing platform packages follow 0.28.2. No package names were added.
+Two findings remain: `csv-parse` requires a major update and `body-parser` 2.3.0
+introduces a nested `content-type` 2.x dependency. Both are deferred for separate
+review. This is not a zero-findings audit report. No audit exception was added.
 
 ## License
 

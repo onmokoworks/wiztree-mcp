@@ -82,6 +82,17 @@ Windows/WizTree/UAC/taskkillの実機動作は未検証です。
 検証では実disk走査・実データ削除・MCP登録・永続権限拡大は実施していません。
 ネイティブ依存は追加していません。
 
+## 依存監査の修復
+
+既存semver範囲の間接依存7件を更新し、critical/highは0件になりました。
+`npm audit --audit-level=high`、型検査・build・16テストが通っています。
+直接依存の宣言、新規パッケージ名、CI監査基準は変更していません。
+具体的な深刻度・修正版・更新差分は[英語READMEの表](./README.md#dependency-audit-follow-up)を参照してください。
+
+残りは`csv-parse`のmoderateと`body-parser`のlowです。
+前者はメジャー更新、後者は新しい入れ子の`content-type` 2.x依存が必要なため別途レビューに保留しました。
+監査を無効化したり、`npm audit fix --force`を使用したりしていません。
+
 ## License
 
 MIT. See [LICENSE](./LICENSE).
