@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import { scanDirectory, saveNativeSnapshot } from "./native-scan.js";
+import { scanWindows } from "./windows-scan.js";
+import { validateSnapshotDestination } from "./snapshots.js";
 import { createReadStream, existsSync } from "node:fs";
-import { mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
+import { readFile, readdir, stat, unlink } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { Transform } from "node:stream";
@@ -139,7 +141,8 @@ function makePreambleSkipper(): Transform {
   });
 }
 
-async function parseCsvStream(resolvedPath: string): Promise<WizTreeEntry[]> {
+async function parseCsvStream(resolvedPath: string, signal?: AbortSignal, maxEntries = 200_000): Promise<WizTreeEntry[]> {
+  signal?.throwIfAborted();
   const parser = parse({ relax_column_count: true, skip_empty_lines: true });
   const stream = createReadStream(resolvedPath);
   const skipper = makePreambleSkipper();
@@ -149,38 +152,58 @@ async function parseCsvStream(resolvedPath: string): Promise<WizTreeEntry[]> {
 
   const entries: WizTreeEntry[] = [];
   let cols: ColumnMap | undefined;
-  for await (const record of parser as AsyncIterable<string[]>) {
-    if (!cols) {
-      cols = resolveColumns(record);
-      continue;
-    }
-    const path = (cols.path >= 0 ? String(record[cols.path] ?? "") : "").trim();
-    if (!path) continue;
+  const onAbort = () => parser.destroy(new Error("CSV analysis cancelled."));
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    for await (const record of parser as AsyncIterable<string[]>) {
+      signal?.throwIfAborted();
+      if (!cols) {
+        cols = resolveColumns(record);
+        continue;
+      }
+      const rawPath = cols.path >= 0 ? String(record[cols.path] ?? "") : "";
+      const path = rawPath.startsWith("/") ? rawPath : rawPath.trim();
+      if (!path) continue;
 
-    const entry: WizTreeEntry = {
-      path,
-      size: parseBytes(cols.size >= 0 ? record[cols.size] : 0),
-      allocated: parseBytes(cols.allocated >= 0 ? record[cols.allocated] : 0),
-      isFolder: path.endsWith("\\") || path.endsWith("/"),
-    };
-    const modified = cols.modified >= 0 ? String(record[cols.modified] ?? "") : "";
-    const attributes = cols.attributes >= 0 ? String(record[cols.attributes] ?? "") : "";
-    const files = parseCount(cols.files >= 0 ? record[cols.files] : undefined);
-    const folders = parseCount(cols.folders >= 0 ? record[cols.folders] : undefined);
-    if (modified) entry.modified = modified;
-    if (attributes) entry.attributes = attributes;
-    if (files !== undefined) entry.files = files;
-    if (folders !== undefined) entry.folders = folders;
-    entries.push(entry);
+      const entry: WizTreeEntry = {
+        path,
+        size: parseBytes(cols.size >= 0 ? record[cols.size] : 0),
+        allocated: parseBytes(cols.allocated >= 0 ? record[cols.allocated] : 0),
+        isFolder: path.endsWith("\\") || path.endsWith("/"),
+      };
+      const modified = cols.modified >= 0 ? String(record[cols.modified] ?? "") : "";
+      const attributes = cols.attributes >= 0 ? String(record[cols.attributes] ?? "") : "";
+      const files = parseCount(cols.files >= 0 ? record[cols.files] : undefined);
+      const folders = parseCount(cols.folders >= 0 ? record[cols.folders] : undefined);
+      if (modified) entry.modified = modified;
+      if (attributes) entry.attributes = attributes;
+      if (files !== undefined) entry.files = files;
+      if (folders !== undefined) entry.folders = folders;
+      if (entries.length >= maxEntries) throw new Error("CSV entry limit reached; choose a smaller scan.");
+      entries.push(entry);
+    }
+    signal?.throwIfAborted();
+    return entries;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    const closed = new Promise<void>(done => {
+      if (stream.closed) done(); else stream.once("close", done);
+    });
+    stream.destroy(); skipper.destroy(); parser.destroy();
+    await closed;
   }
-  return entries;
 }
 
 type CacheEntry = { key: string; mtimeMs: number; size: number; entries: WizTreeEntry[] };
 const CACHE_LIMIT = 3;
 const csvCache: CacheEntry[] = [];
+let scanSnapshot: { id: string; entries: WizTreeEntry[] } | undefined;
 
 async function readCsv(csvPath: string): Promise<WizTreeEntry[]> {
+  if (csvPath.startsWith("scan:")) {
+    if (scanSnapshot?.id === csvPath) return scanSnapshot.entries;
+    throw new Error("In-memory scan expired. Run scan_path again or use a saved CSV.");
+  }
   const resolved = resolve(csvPath);
   if (!existsSync(resolved)) {
     throw new Error(
@@ -269,8 +292,8 @@ function tableResult(header: string[], rows: string[][], preamble?: string) {
 
 function entriesTable(entries: WizTreeEntry[], preamble?: string) {
   return tableResult(
-    ["sizeHuman", "kind", "path"],
-    entries.map((entry) => [formatBytes(entry.size), entry.isFolder ? "folder" : "file", entry.path]),
+    ["sizeHuman", "allocatedHuman", "kind", "path"],
+    entries.map((entry) => [formatBytes(entry.size), formatBytes(entry.allocated), entry.isFolder ? "folder" : "file", entry.path]),
     preamble,
   );
 }
@@ -281,7 +304,7 @@ function extensionOf(entry: WizTreeEntry): string {
 }
 
 function normalizePath(path: string): string {
-  return path.replace(/\//g, "\\").toLowerCase();
+  return path.startsWith("/") ? path : path.replace(/\//g, "\\").toLowerCase();
 }
 
 function commonPrefixLength(a: string, b: string): number {
@@ -294,7 +317,8 @@ function commonPrefixLength(a: string, b: string): number {
 // Direct children of folderPath, sorted by size descending.
 function drillDown(entries: WizTreeEntry[], folderPath: string, limit: number) {
   let folderNorm = normalizePath(folderPath);
-  if (!folderNorm.endsWith("\\")) folderNorm += "\\";
+  const separator = folderPath.startsWith("/") ? "/" : "\\";
+  if (!folderNorm.endsWith(separator)) folderNorm += separator;
 
   const children: WizTreeEntry[] = [];
   let folderExists = false;
@@ -306,8 +330,8 @@ function drillDown(entries: WizTreeEntry[], folderPath: string, limit: number) {
     }
     if (!entryNorm.startsWith(folderNorm)) continue;
     folderExists = true;
-    const remainder = entryNorm.slice(folderNorm.length).replace(/\\$/, "");
-    if (remainder && !remainder.includes("\\")) children.push(entry);
+    const remainder = entryNorm.slice(folderNorm.length).replace(/[\\/]$/, "");
+    if (remainder && !remainder.includes(separator)) children.push(entry);
   }
 
   if (!folderExists) {
@@ -426,54 +450,6 @@ function locateWizTree(explicitPath?: string): string | undefined {
   return findWizTreeCandidates().find((candidate) => existsSync(candidate));
 }
 
-function safeName(input: string): string {
-  return input.replace(/^[A-Za-z]:/, (drive) => drive.replace(":", "")).replace(/[\\/:*?"<>|\s]+/g, "_").replace(/^_+|_+$/g, "") || "scan";
-}
-
-async function runWizTree(args: string[], timeoutSeconds: number): Promise<{ stdout: string; stderr: string }> {
-  return await new Promise((resolvePromise, reject) => {
-    const child = spawn(args[0], args.slice(1), {
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-    const timeout = setTimeout(() => {
-      // On Windows, kill the whole process tree; a plain kill can leave WizTree running.
-      if (isWindows && child.pid) {
-        try {
-          spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true });
-        } catch {
-          child.kill();
-        }
-      } else {
-        child.kill();
-      }
-      reject(new Error(`WizTree timed out after ${timeoutSeconds} seconds.`));
-    }, timeoutSeconds * 1000);
-
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timeout);
-      if (code === 0) {
-        resolvePromise({ stdout, stderr });
-      } else {
-        reject(new Error(`WizTree exited with code ${code}.${stderr ? ` stderr: ${stderr}` : ""}`));
-      }
-    });
-  });
-}
-
 async function imageContent(pngPath: string) {
   const data = await readFile(pngPath);
   return { type: "image" as const, data: data.toString("base64"), mimeType: "image/png" };
@@ -504,7 +480,7 @@ server.registerTool(
   "scan_path",
   {
     title: "Scan Path",
-    description: "Run WizTree CSV export for a drive or folder. This is read-only and writes a CSV snapshot. Windows-only.",
+    description: "Read-only directory scan: WizTree on Windows, metadata traversal on macOS. Both platforms return a scan handle by default; pass it as csvPath to analysis tools.",
     inputSchema: {
       targetPath: z.string().describe('Drive or folder to scan, such as "C:" or "D:\\Data".'),
       wiztreePath: z.string().optional().describe("Optional explicit path to WizTree64.exe or WizTree.exe."),
@@ -519,65 +495,50 @@ server.registerTool(
       filter: z.string().optional().describe('Optional WizTree include filter, such as "*.mp4".'),
       filterExclude: z.string().optional().describe('Optional WizTree exclude filter, such as "node_modules".'),
       sortBy: z.string().optional().describe('Optional WizTree sort option, such as "size".'),
-      treemap: z.boolean().default(false).describe("Also export a 1024x768 treemap PNG beside the CSV."),
+      treemap: z.boolean().default(false).describe("Windows: return a 1024x768 treemap inline; its temporary PNG is removed after reading."),
+      saveSnapshot: z.boolean().default(false).describe("Explicitly save CSV; requires snapshotDirectory and snapshotName. Default keeps only the latest scan in memory, without persistent exports."),
+      snapshotDirectory: z.string().optional().describe("Explicit absolute directory for an intentionally saved CSV."),
+      snapshotName: z.string().optional().describe("Explicit simple filename ending in .csv. Existing files are never overwritten."),
+      maxEntries: z.number().int().positive().max(200_000).default(100_000).describe("Native traversal / Windows CSV entry limit."),
       timeoutSeconds: z.number().int().positive().max(3600).default(300),
     },
   },
-  async (input) => {
+  async (input, extra) => {
+    if (input.saveSnapshot) validateSnapshotDestination(input.snapshotDirectory, input.snapshotName);
+    else if (input.snapshotDirectory || input.snapshotName) throw new Error("Set saveSnapshot: true to use an explicit save destination.");
+    if (process.platform === "darwin") {
+      if (input.admin || input.filter || input.filterExclude || input.sortBy || input.treemap || input.wiztreePath) {
+        return { ...textResult("WizTree-specific options are unsupported on macOS. Use analysis tools to filter or sort the result."), isError: true };
+      }
+      const scan = await scanDirectory(input.targetPath, { signal: extra.signal,
+        timeoutSeconds: input.timeoutSeconds, maxEntries: input.maxEntries });
+      const entries = scan.entries.filter(e => e.isFolder ? input.includeFolders : input.includeFiles);
+      extra.signal.throwIfAborted();
+      const saved = input.saveSnapshot ? await saveNativeSnapshot(entries, input.snapshotDirectory!, input.snapshotName!, extra.signal) : undefined;
+      const id = `scan:${crypto.randomUUID()}`;
+      scanSnapshot = { id, entries };
+      const { entries: _entries, ...details } = scan;
+      return jsonResult({ backend: "macos-native", ...details, csvPath: saved?.csvPath ?? id,
+        ...saved, summary: summarizeEntries(entries) });
+    }
     if (!isWindows) {
-      return textResult("scan_path requires WizTree, which is Windows-only. This host is not Windows. CSV analysis tools still work on any platform.");
+      return { ...textResult("Native scan supports macOS only; CSV analysis works on any platform."), isError: true };
     }
     const wiztree = locateWizTree(input.wiztreePath);
     if (!wiztree) {
       return textResult("WizTree executable was not found. Set WIZTREE_PATH or pass wiztreePath.");
     }
 
-    await mkdir(exportDir, { recursive: true });
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const base = `${safeName(input.targetPath)}_${stamp}`;
-    const csvPath = join(exportDir, `${base}.csv`);
-    const pngPath = join(exportDir, `${base}.png`);
-    const args = [
-      wiztree,
-      input.targetPath,
-      `/export=${csvPath}`,
-      `/admin=${input.admin ? 1 : 0}`,
-      `/exportfiles=${input.includeFiles ? 1 : 0}`,
-      `/exportfolders=${input.includeFolders ? 1 : 0}`,
-    ];
-
-    if (input.filter) args.push(`/filter=${input.filter}`);
-    if (input.filterExclude) args.push(`/filterexclude=${input.filterExclude}`);
-    if (input.sortBy) args.push(`/sortby=${input.sortBy}`);
-    if (input.treemap) {
-      args.push(`/treemapimagefile=${pngPath}`);
-      args.push("/treemapimagewidth=1024");
-      args.push("/treemapimageheight=768");
-      args.push("/treemapimagefreespace=0");
-      args.push("/treemapimageshowallocated=1");
-    }
-
-    const result = await runWizTree(args, input.timeoutSeconds);
-    const entries = existsSync(csvPath) ? await readCsv(csvPath) : [];
-    const hasTreemap = input.treemap && existsSync(pngPath);
-    const content: (
-      | { type: "text"; text: string }
-      | { type: "image"; data: string; mimeType: string }
-    )[] = [
-      {
-        type: "text",
-        text: JSON.stringify({
-          wiztree,
-          targetPath: input.targetPath,
-          csvPath,
-          treemapPath: hasTreemap ? pngPath : undefined,
-          summary: summarizeEntries(entries),
-          stdout: result.stdout.trim() || undefined,
-          stderr: result.stderr.trim() || undefined,
-        }),
-      },
-    ];
-    if (hasTreemap) content.push(await imageContent(pngPath));
+    const result = await scanWindows(wiztree, input, { parseCsv: parseCsvStream }, extra.signal);
+    const id = `scan:${crypto.randomUUID()}`;
+    scanSnapshot = { id, entries: result.entries };
+    const content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] = [{
+      type: "text", text: JSON.stringify({ backend: "windows-wiztree", wiztree,
+        targetPath: input.targetPath, csvPath: result.saved?.csvPath ?? id,
+        ...result.saved, summary: summarizeEntries(result.entries),
+        stdout: result.stdout.trim() || undefined, stderr: result.stderr.trim() || undefined }),
+    }];
+    if (result.image) content.push(result.image);
     return { content };
   },
 );
@@ -595,7 +556,7 @@ server.registerTool(
   async (input) => {
     const entries = await readCsv(input.csvPath);
     return jsonResult({
-      csvPath: resolve(input.csvPath),
+      csvPath: input.csvPath.startsWith("scan:") ? input.csvPath : resolve(input.csvPath),
       summary: summarizeEntries(entries),
       largestFiles: selectTop(entries, "files", input.topLimit, "size").map(entryObject),
       largestFolders: selectTop(entries, "folders", input.topLimit, "size").map(entryObject),
@@ -765,8 +726,8 @@ server.registerTool(
       input.kind === "all" || (input.kind === "files" ? !entry.isFolder : entry.isFolder);
     const before = (await readCsv(input.beforeCsvPath)).filter(keep);
     const after = (await readCsv(input.afterCsvPath)).filter(keep);
-    const beforeMap = new Map(before.map((entry) => [entry.path.toLowerCase(), entry]));
-    const afterMap = new Map(after.map((entry) => [entry.path.toLowerCase(), entry]));
+    const beforeMap = new Map(before.map((entry) => [normalizePath(entry.path), entry]));
+    const afterMap = new Map(after.map((entry) => [normalizePath(entry.path), entry]));
     const keys = new Set([...beforeMap.keys(), ...afterMap.keys()]);
     const changes = [...keys].map((key) => {
       const oldEntry = beforeMap.get(key);
@@ -811,64 +772,67 @@ server.registerTool(
   },
 );
 
-server.registerTool(
-  "cleanup_snapshots",
-  {
-    title: "Cleanup Snapshots",
-    description: "Delete older CSV/PNG exports from the export directory, keeping the most recent ones. Never touches files outside the export directory.",
-    inputSchema: {
-      keepLatest: z.number().int().nonnegative().max(1000).default(5).describe("Number of most recent snapshots (by base name) to keep."),
+// Opt-in disablement preserves existing Windows/default behavior.
+if (process.env.WIZTREE_MCP_DISABLE_CLEANUP !== "1") {
+  server.registerTool(
+    "cleanup_snapshots",
+    {
+      title: "Cleanup Snapshots",
+      description: "Legacy explicit cleanup: delete older CSV/PNG files from the configured export directory. Disable with WIZTREE_MCP_DISABLE_CLEANUP=1.",
+      inputSchema: {
+        keepLatest: z.number().int().nonnegative().max(1000).default(5).describe("Number of most recent snapshots (by base name) to keep."),
+      },
     },
-  },
-  async (input) => {
-    if (!existsSync(exportDir)) {
-      return jsonResult({ exportDir, deleted: [], kept: [], note: "Export directory does not exist yet." });
-    }
-    const names = await readdir(exportDir);
-    // Group CSV/PNG by base name (a snapshot); track newest mtime per group.
-    const groups = new Map<string, { files: string[]; mtimeMs: number }>();
-    for (const name of names) {
-      const lower = name.toLowerCase();
-      if (!lower.endsWith(".csv") && !lower.endsWith(".png")) continue;
-      const full = join(exportDir, name);
-      const stats = await stat(full);
-      const base = name.slice(0, name.length - extname(name).length);
-      const group = groups.get(base) ?? { files: [], mtimeMs: 0 };
-      group.files.push(full);
-      group.mtimeMs = Math.max(group.mtimeMs, stats.mtimeMs);
-      groups.set(base, group);
-    }
-    const ordered = [...groups.values()].sort((a, b) => b.mtimeMs - a.mtimeMs);
-    const kept = ordered.slice(0, input.keepLatest);
-    const toDelete = ordered.slice(input.keepLatest);
-
-    const deleted: string[] = [];
-    for (const group of toDelete) {
-      for (const file of group.files) {
-        const resolved = resolve(file);
-        // Safety: only ever delete inside the export directory.
-        if (resolved !== exportDir && !resolved.startsWith(exportDir + "\\") && !resolved.startsWith(exportDir + "/")) {
-          continue;
-        }
-        await unlink(resolved);
-        deleted.push(resolved);
+    async (input) => {
+      if (!existsSync(exportDir)) {
+        return jsonResult({ exportDir, deleted: [], kept: [], note: "Export directory does not exist yet." });
       }
-    }
-    return jsonResult({
-      exportDir,
-      keptSnapshots: kept.length,
-      deleted,
-      keptFiles: kept.flatMap((group) => group.files.map((file) => basename(file))),
-    });
-  },
-);
+      const names = await readdir(exportDir);
+      // Group CSV/PNG by base name (a snapshot); track newest mtime per group.
+      const groups = new Map<string, { files: string[]; mtimeMs: number }>();
+      for (const name of names) {
+        const lower = name.toLowerCase();
+        if (!lower.endsWith(".csv") && !lower.endsWith(".png")) continue;
+        const full = join(exportDir, name);
+        const stats = await stat(full);
+        const base = name.slice(0, name.length - extname(name).length);
+        const group = groups.get(base) ?? { files: [], mtimeMs: 0 };
+        group.files.push(full);
+        group.mtimeMs = Math.max(group.mtimeMs, stats.mtimeMs);
+        groups.set(base, group);
+      }
+      const ordered = [...groups.values()].sort((a, b) => b.mtimeMs - a.mtimeMs);
+      const kept = ordered.slice(0, input.keepLatest);
+      const toDelete = ordered.slice(input.keepLatest);
+
+      const deleted: string[] = [];
+      for (const group of toDelete) {
+        for (const file of group.files) {
+          const resolved = resolve(file);
+          // Safety: only ever delete inside the export directory.
+          if (resolved !== exportDir && !resolved.startsWith(exportDir + "\\") && !resolved.startsWith(exportDir + "/")) {
+            continue;
+          }
+          await unlink(resolved);
+          deleted.push(resolved);
+        }
+      }
+      return jsonResult({
+        exportDir,
+        keptSnapshots: kept.length,
+        deleted,
+        keptFiles: kept.flatMap((group) => group.files.map((file) => basename(file))),
+      });
+    },
+  );
+}
 
 // --- Startup ---------------------------------------------------------------
 
 async function startServer() {
   if (!isWindows) {
     process.stderr.write(
-      "wiztree-mcp: WizTree is Windows-only. scan_path will not run on this host, but CSV analysis tools work anywhere.\n",
+      "wiztree-mcp: macOS uses read-only metadata scanning; CSV analysis is cross-platform.\n",
     );
   }
   const transport = new StdioServerTransport();
